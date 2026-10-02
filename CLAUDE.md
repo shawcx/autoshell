@@ -13,8 +13,24 @@ README, or build tooling. It is just the `autoshell/` package.
 
 The package is imported as `autoshell` and uses relative imports internally. `__init__.py` defines
 the exceptions before it imports the submodules, which import them with `from . import error`.
-Keep that order. To try changes, write a small script that decorates some functions and pipes
-input into `autoshell.Shell().Start()`. There's no test suite.
+Keep that order.
+
+## Commands
+
+```sh
+pytest                                              # run all tests
+pytest tests/test_shell.py::test_nested_group       # run one test
+pip install -e '.[test]'                            # editable install with pytest
+```
+
+`pyproject.toml` sets `pythonpath = ["."]`, so `pytest` works without installing the package.
+
+## Tests
+
+`tests/conftest.py` provides two fixtures. `one("cmd")` runs a single command, and
+`script(*lines)` runs a whole session through `Start()`. Both return what the shell wrote.
+Commands register into one process-wide tree when they're decorated, so every command name must be
+unique across all test files, and no test may rely on a command defined in another file.
 
 ## Architecture
 
