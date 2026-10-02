@@ -5,16 +5,21 @@ signature becomes the command line: parameters turn into arguments and options, 
 becomes the help text, and the shell gives you tab completion, history, and nested command
 groups.
 
-```
+```console
 $ greet world --times 2
 hello, world!
 hello, world!
-
-$ tasks
-tasks $ add "write docs" --priority 2
+$ tasks add "write docs" --priority 2
 added task 1
-tasks $ ..
-$ help
+$ tasks list
+2 write docs
+$ help tasks
+tasks
+manage tasks
+
+Commands
+  add   add a task
+  list  list tasks
 ```
 
 ## Install
