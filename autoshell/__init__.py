@@ -1,5 +1,4 @@
 
-from . import io
 
 # exception to raise on parse error
 class error(Exception):

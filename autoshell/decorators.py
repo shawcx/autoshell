@@ -1,121 +1,53 @@
 
 import inspect
+import typing
 
 from . import error
 from .arguments import CommandParser
-from .shell import Shell
 
 GROUP   = 1
-HIDDEN  = 2
+SHADOW  = 2
 INIT    = 3
 COMMAND = 4
 MEMBER  = 5
 
 __all__ = ['Group', 'Shadow', 'Ignore', 'Member', 'Command', 'GroupInit']
 
-#
-#
-#
-
-def Group(cls):
-    'add member functions decorated with @Member as sub-commands'
-
-    cls.__AutoShell__ = GROUP
-    action = cls.__name__.lower()
-    instance = cls()
-
-    groupparser = CommandParser(prog=action)
-    groupparser.add_argument('<command>')
-    groupparser.handlers = {}
-    groupparser.prefix = action + ' '
-    groupparser.instance = instance
-    groupparser.meta_init = None
-    groupparser.instance._parser = groupparser
-    groupparser.instance._parent = Shell.root
-    groupparser.instance._root   = Shell.root
-
-    Shell.parser.handlers[action] = groupparser
-
-    for name in dir(instance):
-        if name.startswith('__'):
-            continue
-        fn = getattr(instance, name)
-        if not hasattr(fn, '__AutoShell__'):
-            continue
-
-        name = name.lower()
-
-        if fn.__AutoShell__ == MEMBER:
-            parser = CommandParser(prog=name)
-            parser.fn = fn
-            compute_args(fn, parser, 1)
-        elif fn.__AutoShell__ == GROUP:
-            parser = Shell.parser.handlers[name]
-            parser.instance._parent = instance
-            parser.prefix = groupparser.prefix + parser.prefix
-            del Shell.parser.handlers[name]
-        elif fn.__AutoShell__ == INIT:
-            groupparser.meta_init = fn
-            continue
-        else:
-            raise ValueError('Not implemented')
-
-        groupparser.handlers[name] = parser
-
-    return cls
+# every @Command, @Group and @Shadow in definition order; a Shell given no
+# explicit commands is built from this
+registry = []
 
 #
+# decorators only mark; build() turns the marks into parsers for one shell
 #
-#
-
-def Shadow(cls):
-    cls.__AutoShell__ = GROUP
-    instance = cls()
-    instance._root = Shell.root
-
-    for name in dir(instance):
-        if name.startswith('__'):
-            continue
-        fn = getattr(instance, name)
-        if not hasattr(fn, '__AutoShell__'):
-            continue
-
-        name = name.lower()
-
-        if fn.__AutoShell__ == MEMBER:
-            parser = CommandParser(prog=name)
-            parser.fn = fn
-            compute_args(fn, parser, 1)
-        else:
-            raise ValueError('Not implemented')
-
-        Shell.parser.handlers[name] = parser
-
-    return cls
 
 def Command(fn):
-    'add the command to the base parser'
-    # mark the function for when we iterate the class
+    'a top-level command'
+    check_args(fn)
     fn.__AutoShell__ = COMMAND
-    fn._root = Shell.root
-
-    action = fn.__name__.lower()
-
-    parser = CommandParser(prog=action)
-    parser.fn = fn
-    Shell.parser.handlers[action] = parser
-
-    compute_args(fn, parser)
-
+    registry.append(fn)
     return fn
 
+def Group(cls):
+    'a group of sub-commands made of the methods decorated with @Member'
+    cls.__AutoShell__ = GROUP
+    registry.append(cls)
+    return cls
+
+def Shadow(cls):
+    'add the methods decorated with @Member as top-level commands'
+    cls.__AutoShell__ = SHADOW
+    registry.append(cls)
+    return cls
+
 def Member(fn):
-    'mark the function, will be processed when the class is decorated'
+    'a sub-command of the enclosing @Group or @Shadow class'
+    check_args(fn)
     fn.__AutoShell__ = MEMBER
     return fn
 
 def GroupInit(fn):
-    'mark the function, will be processed when the class is decorated'
+    'called when the group is entered without a sub-command; return True to stay in it'
     fn.__AutoShell__ = INIT
     return fn
 
@@ -123,10 +55,152 @@ def Ignore(fn):
     'convenience function for verbose function decorators'
     return fn
 
+#
+# building the parser tree
+#
+
+# attributes build() sets on group instances; never scanned for commands
+_LINKS = ('_parser', '_parent', '_root')
+
+def build(commands, root):
+    '''return the root parser for a shell. commands holds @Command functions
+    and @Group/@Shadow classes or instances; classes are instantiated with no
+    arguments. a group nested inside another is left out of the top level.'''
+    parser = CommandParser(prog='')
+    parser.add_argument('command')
+    parser.handlers = {}
+    parser.path = ()
+
+    nested = set()
+    groups = {}
+
+    for item in commands:
+        kind = getattr(item, '__AutoShell__', None)
+
+        if kind == COMMAND:
+            item._root = root
+            name = item.__name__.lower()
+            parser.handlers[name] = command_parser(item, name, complete=getattr(item, 'complete', None))
+
+        elif kind == GROUP:
+            instance = instantiate(item)
+            name = type(instance).__name__.lower()
+            parser.handlers[name] = group_parser(instance, name, parser, root, root, nested)
+            groups[name] = type(instance)
+
+        elif kind == SHADOW:
+            instance = instantiate(item)
+            for name, fn in members(instance):
+                if fn.__AutoShell__ != MEMBER:
+                    raise ValueError('Not implemented')
+                parser.handlers[name] = command_parser(fn, name, 1, completer(instance, name))
+            instance._root = root
+
+        else:
+            raise ValueError('not a command, group or shadow: %r' % (item,))
+
+    for name, cls in groups.items():
+        if cls in nested:
+            del parser.handlers[name]
+
+    return parser
+
+def completer(instance, name):
+    'the complete_<name>(text, args) method of instance, if any'
+    return getattr(instance, 'complete_' + name, None)
+
+def instantiate(item):
+    return item() if isinstance(item, type) else item
+
+def members(instance):
+    'yield (name, value) for the marked attributes of instance'
+    for name in dir(instance):
+        if name.startswith('__') or name in _LINKS:
+            continue
+        # don't run property getters; the instance isn't linked up yet
+        if isinstance(getattr(type(instance), name, None), property):
+            continue
+        value = getattr(instance, name)
+        if hasattr(value, '__AutoShell__'):
+            yield name.lower(), value
+
+def group_parser(instance, name, parent_parser, parent, root, nested):
+    parser = CommandParser(prog=name)
+    parser.add_argument('<command>')
+    parser.handlers = {}
+    parser.path = parent_parser.path + (name,)
+    parser.description = type(instance).__doc__
+    parser.instance = instance
+    parser.meta_init = None
+
+    for attr, value in members(instance):
+        kind = value.__AutoShell__
+        if kind == MEMBER:
+            parser.handlers[attr] = command_parser(value, attr, 1, completer(instance, attr))
+        elif kind == GROUP:
+            child = instantiate(value)
+            nested.add(type(child))
+            parser.handlers[attr] = group_parser(child, attr, parser, instance, root, nested)
+        elif kind == INIT:
+            parser.meta_init = value
+        else:
+            raise ValueError('Not implemented')
+
+    instance._parser = parser
+    instance._parent = parent
+    instance._root   = root
+    return parser
+
+def command_parser(fn, name, argoffset=0, complete=None):
+    parser = CommandParser(prog=name)
+    parser.fn = fn
+    parser.complete = complete
+    compute_args(fn, parser, argoffset)
+    return parser
+
+def check_args(fn):
+    spec = inspect.getfullargspec(fn)
+    if spec.varkw or spec.kwonlyargs:
+        raise error('Keyword arguments not implemented')
+
+# accepted for parameters annotated as bool
+TRUE_VALUES  = ('t', 'true',  'y', 'yes', '1', 'on')
+FALSE_VALUES = ('f', 'false', 'n', 'no',  '0', 'off')
+
+def boolean(text):
+    'argparse type for bool: yes/no, on/off, true/false, y/n, t/f, 1/0'
+    value = text.lower()
+    if value in TRUE_VALUES:
+        return True
+    if value in FALSE_VALUES:
+        return False
+    raise ValueError(text)
+
+def option_name(arg):
+    'v -> -v, dry_run -> --dry-run'
+    if len(arg) == 1:
+        return '-' + arg
+    return '--' + arg.replace('_', '-')
+
+def type_hints(fn):
+    try:
+        return typing.get_type_hints(getattr(fn, '__func__', fn))
+    except Exception:
+        return {}
+
+def hinted_type(hints, arg):
+    'the argparse type for an annotated parameter, or None'
+    hint = hints.get(arg)
+    if hint is bool:
+        return boolean
+    if isinstance(hint, type):
+        return hint
+    return None
 
 def compute_args(fn, parser, argoffset=0):
     parser.description = fn.__doc__
     spec = inspect.getfullargspec(fn)
+    hints = type_hints(fn)
 
     args = spec.args[argoffset:]
 
@@ -140,24 +214,34 @@ def compute_args(fn, parser, argoffset=0):
     parser.order = []
 
     for arg in posargs:
-        parser.add_argument(arg, metavar='<'+arg+'>')
+        kind = hinted_type(hints, arg)
+        if kind:
+            parser.add_argument(arg, metavar='<'+arg+'>', type=kind)
+        else:
+            parser.add_argument(arg, metavar='<'+arg+'>')
         parser.order.append(arg)
 
     if spec.defaults:
         for arg,val in zip(optargs, spec.defaults):
             parser.order.append(arg)
-            prefix = '-' if 1 == len(arg) else '--'
-            arg = prefix+arg
-            if val is None:
-                parser.add_argument(arg)
-            elif val is True:
-                parser.add_argument(arg, action='store_false', default=val)
+            kind = hinted_type(hints, arg)
+            if val is True:
+                # on by default, so the flag turns it off
+                parser.add_argument('--no-' + arg.replace('_', '-'), dest=arg,
+                                    action='store_false', default=True)
             elif val is False:
-                parser.add_argument(arg, action='store_true', default=val)
+                parser.add_argument(option_name(arg), dest=arg, action='store_true', default=False)
+            elif val is None:
+                if kind:
+                    parser.add_argument(option_name(arg), dest=arg, type=kind, metavar=hints[arg].__name__)
+                else:
+                    parser.add_argument(option_name(arg), dest=arg)
             else:
-                parser.add_argument(arg, type=val.__class__, metavar=type(val).__name__, default=val)
+                kind = kind or type(val)
+                hint = hints.get(arg, type(val))
+                parser.add_argument(option_name(arg), dest=arg, type=kind,
+                                    metavar=getattr(hint, '__name__', 'value'), default=val)
 
     parser.varargs = True if spec.varargs else False
 
-    if spec.varkw or spec.kwonlyargs:
-        raise error('Keyword arguments not implemented')
+    check_args(fn)
